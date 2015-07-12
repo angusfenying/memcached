@@ -1,11 +1,16 @@
 /* -*- Mode: C; tab-width: 4; c-basic-offset: 4; indent-tabs-mode: nil -*- */
 #include "memcached.h"
+
+#ifndef __WIN32__
 #include <sys/stat.h>
 #include <sys/socket.h>
 #include <sys/signal.h>
 #include <sys/resource.h>
-#include <fcntl.h>
 #include <netinet/in.h>
+#endif
+
+#include <fcntl.h>
+
 #include <errno.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -1413,9 +1418,9 @@ static int lru_crawler_start(uint32_t id, uint32_t remaining) {
  * Also only clear the crawlerstats once per sid.
  */
 enum crawler_result_type lru_crawler_crawl(char *slabs) {
-    char *b = NULL;
     uint32_t sid = 0;
     int starts = 0;
+    char *b = NULL;
     uint8_t tocrawl[MAX_NUMBER_OF_SLAB_CLASSES];
     if (pthread_mutex_trylock(&lru_crawler_lock) != 0) {
         return CRAWLER_RUNNING;
@@ -1466,7 +1471,9 @@ void lru_crawler_resume(void) {
 
 int init_lru_crawler(void) {
     if (lru_crawler_initialized == 0) {
+
         memset(&crawlerstats, 0, sizeof(crawlerstats_t) * MAX_NUMBER_OF_SLAB_CLASSES);
+
         if (pthread_cond_init(&lru_crawler_cond, NULL) != 0) {
             fprintf(stderr, "Can't initialize lru crawler condition\n");
             return -1;

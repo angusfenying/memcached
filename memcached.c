@@ -14,15 +14,17 @@
  *      Brad Fitzpatrick <brad@danga.com>
  */
 #include "memcached.h"
+
+#ifndef __WIN32__
+
 #include <sys/stat.h>
 #include <sys/socket.h>
 #include <sys/un.h>
-#include <signal.h>
-#include <sys/param.h>
 #include <sys/resource.h>
 #include <sys/uio.h>
-#include <ctype.h>
-#include <stdarg.h>
+#include <netinet/tcp.h>
+#include <arpa/inet.h>
+#include <signal.h>
 
 /* some POSIX systems need the following definition
  * to get mlockall flags out of sys/mman.h.  */
@@ -35,16 +37,6 @@
 #endif
 #include <pwd.h>
 #include <sys/mman.h>
-#include <fcntl.h>
-#include <netinet/tcp.h>
-#include <arpa/inet.h>
-#include <errno.h>
-#include <stdlib.h>
-#include <stdio.h>
-#include <string.h>
-#include <time.h>
-#include <assert.h>
-#include <limits.h>
 #include <sysexits.h>
 #include <stddef.h>
 
@@ -54,6 +46,26 @@
 # define IOV_MAX 1024
 #endif
 #endif
+
+#else
+
+#include <getopt.h>
+#include <unistd.h>
+
+#endif /* !__WIN32__ */
+
+#include <fcntl.h>
+#include <errno.h>
+#include <stdlib.h>
+#include <stdio.h>
+#include <string.h>
+#include <time.h>
+#include <assert.h>
+#include <limits.h>
+#include <ctype.h>
+#include <stdarg.h>
+#include <inttypes.h>
+#include <sys/param.h>
 
 /*
  * forward declarations
@@ -104,14 +116,16 @@ static void conn_free(conn *c);
 struct stats stats;
 struct settings settings;
 time_t process_started;     /* when the process was started */
-conn **conns;
+
+static conn **freeconns;
+static int freetotal;
+static int freecurr;
 
 struct slab_rebalance slab_rebal;
 volatile int slab_rebalance_signal;
 
 /** file scope variables **/
 static conn *listen_conn = NULL;
-static int max_fds;
 static struct event_base *main_base;
 
 enum transmit_result {
@@ -308,29 +322,55 @@ extern pthread_mutex_t conn_lock;
  * used for things other than connections, but that's worth it in exchange for
  * being able to directly index the conns array by FD.
  */
+
 static void conn_init(void) {
-    /* We're unlikely to see an FD much higher than maxconns. */
-    int next_fd = dup(1);
-    int headroom = 10;      /* account for extra unexpected open FDs */
-    struct rlimit rl;
-
-    max_fds = settings.maxconns + headroom + next_fd;
-
-    /* But if possible, get the actual highest FD we can possibly ever see. */
-    if (getrlimit(RLIMIT_NOFILE, &rl) == 0) {
-        max_fds = rl.rlim_max;
-    } else {
-        fprintf(stderr, "Failed to query maximum file descriptor; "
-                        "falling back to maxconns\n");
-    }
-
-    close(next_fd);
-
-    if ((conns = calloc(max_fds, sizeof(conn *))) == NULL) {
+    freetotal = settings.maxconns;
+    freecurr = 0;
+    if ((freeconns = calloc(freetotal, sizeof(conn *))) == NULL) {
         fprintf(stderr, "Failed to allocate connection structures\n");
-        /* This is unrecoverable so bail out early. */
-        exit(1);
     }
+    return;
+}
+
+/*
+ * Returns a connection from the freelist, if any.
+ */
+conn *conn_from_freelist() {
+    conn *c;
+
+    pthread_mutex_lock(&conn_lock);
+    if (freecurr > 0) {
+        c = freeconns[--freecurr];
+    } else {
+        c = NULL;
+    }
+    pthread_mutex_unlock(&conn_lock);
+
+    return c;
+}
+
+/*
+ * Adds a connection to the freelist. 0 = success.
+ */
+bool conn_add_to_freelist(conn *c) {
+    bool ret = true;
+    pthread_mutex_lock(&conn_lock);
+    if (freecurr < freetotal) {
+        freeconns[freecurr++] = c;
+        ret = false;
+    } else {
+        /* try to enlarge free connections array */
+        size_t newsize = freetotal * 2;
+        conn **new_freeconns = realloc(freeconns, sizeof(conn *) * newsize);
+        if (new_freeconns) {
+            freetotal = newsize;
+            freeconns = new_freeconns;
+            freeconns[freecurr++] = c;
+            ret = false;
+        }
+    }
+    pthread_mutex_unlock(&conn_lock);
+    return ret;
 }
 
 static const char *prot_text(enum protocol prot) {
@@ -353,10 +393,7 @@ conn *conn_new(const int sfd, enum conn_states init_state,
                 const int event_flags,
                 const int read_buffer_size, enum network_transport transport,
                 struct event_base *base) {
-    conn *c;
-
-    assert(sfd >= 0 && sfd < max_fds);
-    c = conns[sfd];
+    conn *c = conn_from_freelist();
 
     if (NULL == c) {
         if (!(c = (conn *)calloc(1, sizeof(conn)))) {
@@ -405,7 +442,6 @@ conn *conn_new(const int sfd, enum conn_states init_state,
         STATS_UNLOCK();
 
         c->sfd = sfd;
-        conns[sfd] = c;
     }
 
     c->transport = transport;
@@ -448,6 +484,7 @@ conn *conn_new(const int sfd, enum conn_states init_state,
         }
     }
 
+    c->sfd = sfd;
     c->state = init_state;
     c->rlbytes = 0;
     c->cmd = -1;
@@ -475,6 +512,9 @@ conn *conn_new(const int sfd, enum conn_states init_state,
     c->ev_flags = event_flags;
 
     if (event_add(&c->event, 0) == -1) {
+        if (conn_add_to_freelist(c)) {
+            conn_free(c);
+        }
         perror("event_add");
         return NULL;
     }
@@ -518,7 +558,22 @@ static void conn_release_items(conn *c) {
 static void conn_cleanup(conn *c) {
     assert(c != NULL);
 
-    conn_release_items(c);
+    if (c->item) {
+        item_remove(c->item);
+        c->item = 0;
+    }
+
+    if (c->ileft != 0) {
+        for (; c->ileft > 0; c->ileft--,c->icurr++) {
+            item_remove(*(c->icurr));
+        }
+    }
+
+    if (c->suffixleft != 0) {
+        for (; c->suffixleft > 0; c->suffixleft--, c->suffixcurr++) {
+            cache_free(c->thread->suffix_cache, *(c->suffixcurr));
+        }
+    }
 
     if (c->write_and_free) {
         free(c->write_and_free);
@@ -530,10 +585,6 @@ static void conn_cleanup(conn *c) {
         sasl_dispose(&c->sasl_conn);
         c->sasl_conn = NULL;
     }
-
-    if (IS_UDP(c->transport)) {
-        conn_set_state(c, conn_read);
-    }
 }
 
 /*
@@ -541,11 +592,7 @@ static void conn_cleanup(conn *c) {
  */
 void conn_free(conn *c) {
     if (c) {
-        assert(c != NULL);
-        assert(c->sfd >= 0 && c->sfd < max_fds);
-
         MEMCACHED_CONN_DESTROY(c);
-        conns[c->sfd] = NULL;
         if (c->hdrbuf)
             free(c->hdrbuf);
         if (c->msglist)
@@ -573,15 +620,15 @@ static void conn_close(conn *c) {
     if (settings.verbose > 1)
         fprintf(stderr, "<%d connection closed.\n", c->sfd);
 
+    MEMCACHED_CONN_RELEASE(c->sfd);
+    close(c->sfd);
+    accept_new_conns(true);
     conn_cleanup(c);
 
-    MEMCACHED_CONN_RELEASE(c->sfd);
-    conn_set_state(c, conn_closed);
-    close(c->sfd);
-
-    pthread_mutex_lock(&conn_lock);
-    allow_new_conns = true;
-    pthread_mutex_unlock(&conn_lock);
+    /* if the connection has big buffers, just free it */
+    if (c->rsize > READ_BUFFER_HIGHWAT || conn_add_to_freelist(c)) {
+        conn_free(c);
+    }
 
     STATS_LOCK();
     stats.curr_conns--;
@@ -1126,10 +1173,10 @@ static void complete_incr_bin(conn *c) {
         for (i = 0; i < nkey; i++) {
             fprintf(stderr, "%c", key[i]);
         }
-        fprintf(stderr, " %lld, %llu, %d\n",
-                (long long)req->message.body.delta,
-                (long long)req->message.body.initial,
-                req->message.body.expiration);
+        fprintf(stderr, " %" PRIu64 ", %" PRIu64 ", %" PRIu64 "\n",
+                (unsigned long long)req->message.body.delta,
+                (unsigned long long)req->message.body.initial,
+                (unsigned long long)req->message.body.expiration);
     }
 
     if (c->binary_header.request.cas != 0) {
@@ -1157,7 +1204,7 @@ static void complete_incr_bin(conn *c) {
             /* Save some room for the response */
             rsp->message.body.value = htonll(req->message.body.initial);
 
-            snprintf(tmpbuf, INCR_MAX_STORAGE_LEN, "%llu",
+            snprintf(tmpbuf, INCR_MAX_STORAGE_LEN, "%" PRIu64,
                 (unsigned long long)req->message.body.initial);
             int res = strlen(tmpbuf);
             it = item_alloc(key, nkey, 0, realtime(req->message.body.expiration),
@@ -2340,7 +2387,7 @@ enum store_item_type do_store_item(item *it, int comm, conn *c, const uint32_t h
             pthread_mutex_unlock(&c->thread->stats.mutex);
 
             if(settings.verbose > 1) {
-                fprintf(stderr, "CAS:  failure: expected %llu, got %llu\n",
+                fprintf(stderr, "CAS:  failure: expected %" PRIu64 ", got %" PRIu64 "\n",
                         (unsigned long long)ITEM_get_cas(old_it),
                         (unsigned long long)ITEM_get_cas(it));
             }
@@ -2595,58 +2642,58 @@ static void server_stats(ADD_STAT add_stats, conn *c) {
     APPEND_STAT("curr_connections", "%u", stats.curr_conns - 1);
     APPEND_STAT("total_connections", "%u", stats.total_conns);
     if (settings.maxconns_fast) {
-        APPEND_STAT("rejected_connections", "%llu", (unsigned long long)stats.rejected_conns);
+        APPEND_STAT("rejected_connections", "%" PRIu64, (unsigned long long)stats.rejected_conns);
     }
     APPEND_STAT("connection_structures", "%u", stats.conn_structs);
     APPEND_STAT("reserved_fds", "%u", stats.reserved_fds);
-    APPEND_STAT("cmd_get", "%llu", (unsigned long long)thread_stats.get_cmds);
-    APPEND_STAT("cmd_set", "%llu", (unsigned long long)slab_stats.set_cmds);
-    APPEND_STAT("cmd_flush", "%llu", (unsigned long long)thread_stats.flush_cmds);
-    APPEND_STAT("cmd_touch", "%llu", (unsigned long long)thread_stats.touch_cmds);
-    APPEND_STAT("get_hits", "%llu", (unsigned long long)slab_stats.get_hits);
-    APPEND_STAT("get_misses", "%llu", (unsigned long long)thread_stats.get_misses);
-    APPEND_STAT("delete_misses", "%llu", (unsigned long long)thread_stats.delete_misses);
-    APPEND_STAT("delete_hits", "%llu", (unsigned long long)slab_stats.delete_hits);
-    APPEND_STAT("incr_misses", "%llu", (unsigned long long)thread_stats.incr_misses);
-    APPEND_STAT("incr_hits", "%llu", (unsigned long long)slab_stats.incr_hits);
-    APPEND_STAT("decr_misses", "%llu", (unsigned long long)thread_stats.decr_misses);
-    APPEND_STAT("decr_hits", "%llu", (unsigned long long)slab_stats.decr_hits);
-    APPEND_STAT("cas_misses", "%llu", (unsigned long long)thread_stats.cas_misses);
-    APPEND_STAT("cas_hits", "%llu", (unsigned long long)slab_stats.cas_hits);
-    APPEND_STAT("cas_badval", "%llu", (unsigned long long)slab_stats.cas_badval);
-    APPEND_STAT("touch_hits", "%llu", (unsigned long long)slab_stats.touch_hits);
-    APPEND_STAT("touch_misses", "%llu", (unsigned long long)thread_stats.touch_misses);
-    APPEND_STAT("auth_cmds", "%llu", (unsigned long long)thread_stats.auth_cmds);
-    APPEND_STAT("auth_errors", "%llu", (unsigned long long)thread_stats.auth_errors);
-    APPEND_STAT("bytes_read", "%llu", (unsigned long long)thread_stats.bytes_read);
-    APPEND_STAT("bytes_written", "%llu", (unsigned long long)thread_stats.bytes_written);
-    APPEND_STAT("limit_maxbytes", "%llu", (unsigned long long)settings.maxbytes);
+    APPEND_STAT("cmd_get", "%" PRIu64, (unsigned long long)thread_stats.get_cmds);
+    APPEND_STAT("cmd_set", "%" PRIu64, (unsigned long long)slab_stats.set_cmds);
+    APPEND_STAT("cmd_flush", "%" PRIu64, (unsigned long long)thread_stats.flush_cmds);
+    APPEND_STAT("cmd_touch", "%" PRIu64, (unsigned long long)thread_stats.touch_cmds);
+    APPEND_STAT("get_hits", "%" PRIu64, (unsigned long long)slab_stats.get_hits);
+    APPEND_STAT("get_misses", "%" PRIu64, (unsigned long long)thread_stats.get_misses);
+    APPEND_STAT("delete_misses", "%" PRIu64, (unsigned long long)thread_stats.delete_misses);
+    APPEND_STAT("delete_hits", "%" PRIu64, (unsigned long long)slab_stats.delete_hits);
+    APPEND_STAT("incr_misses", "%" PRIu64, (unsigned long long)thread_stats.incr_misses);
+    APPEND_STAT("incr_hits", "%" PRIu64, (unsigned long long)slab_stats.incr_hits);
+    APPEND_STAT("decr_misses", "%" PRIu64, (unsigned long long)thread_stats.decr_misses);
+    APPEND_STAT("decr_hits", "%" PRIu64, (unsigned long long)slab_stats.decr_hits);
+    APPEND_STAT("cas_misses", "%" PRIu64, (unsigned long long)thread_stats.cas_misses);
+    APPEND_STAT("cas_hits", "%" PRIu64, (unsigned long long)slab_stats.cas_hits);
+    APPEND_STAT("cas_badval", "%" PRIu64, (unsigned long long)slab_stats.cas_badval);
+    APPEND_STAT("touch_hits", "%" PRIu64, (unsigned long long)slab_stats.touch_hits);
+    APPEND_STAT("touch_misses", "%" PRIu64, (unsigned long long)thread_stats.touch_misses);
+    APPEND_STAT("auth_cmds", "%" PRIu64, (unsigned long long)thread_stats.auth_cmds);
+    APPEND_STAT("auth_errors", "%" PRIu64, (unsigned long long)thread_stats.auth_errors);
+    APPEND_STAT("bytes_read", "%" PRIu64, (unsigned long long)thread_stats.bytes_read);
+    APPEND_STAT("bytes_written", "%" PRIu64, (unsigned long long)thread_stats.bytes_written);
+    APPEND_STAT("limit_maxbytes", "%" PRIu64, (unsigned long long)settings.maxbytes);
     APPEND_STAT("accepting_conns", "%u", stats.accepting_conns);
-    APPEND_STAT("listen_disabled_num", "%llu", (unsigned long long)stats.listen_disabled_num);
+    APPEND_STAT("listen_disabled_num", "%" PRIu64, (unsigned long long)stats.listen_disabled_num);
     APPEND_STAT("threads", "%d", settings.num_threads);
-    APPEND_STAT("conn_yields", "%llu", (unsigned long long)thread_stats.conn_yields);
+    APPEND_STAT("conn_yields", "%" PRIu64, (unsigned long long)thread_stats.conn_yields);
     APPEND_STAT("hash_power_level", "%u", stats.hash_power_level);
-    APPEND_STAT("hash_bytes", "%llu", (unsigned long long)stats.hash_bytes);
+    APPEND_STAT("hash_bytes", "%" PRIu64, (unsigned long long)stats.hash_bytes);
     APPEND_STAT("hash_is_expanding", "%u", stats.hash_is_expanding);
     if (settings.slab_reassign) {
         APPEND_STAT("slab_reassign_running", "%u", stats.slab_reassign_running);
-        APPEND_STAT("slabs_moved", "%llu", stats.slabs_moved);
+        APPEND_STAT("slabs_moved", "%" PRIu64, stats.slabs_moved);
     }
     if (settings.lru_crawler) {
         APPEND_STAT("lru_crawler_running", "%u", stats.lru_crawler_running);
         APPEND_STAT("lru_crawler_starts", "%u", stats.lru_crawler_starts);
     }
     if (settings.lru_maintainer_thread) {
-        APPEND_STAT("lru_maintainer_juggles", "%llu", (unsigned long long)stats.lru_maintainer_juggles);
+        APPEND_STAT("lru_maintainer_juggles", "%" PRIu64, (unsigned long long)stats.lru_maintainer_juggles);
     }
-    APPEND_STAT("malloc_fails", "%llu",
+    APPEND_STAT("malloc_fails", "%" PRIu64,
                 (unsigned long long)stats.malloc_fails);
     STATS_UNLOCK();
 }
 
 static void process_stat_settings(ADD_STAT add_stats, void *c) {
     assert(add_stats);
-    APPEND_STAT("maxbytes", "%llu", (unsigned long long)settings.maxbytes);
+    APPEND_STAT("maxbytes", "%" PRIu64, (unsigned long long)settings.maxbytes);
     APPEND_STAT("maxconns", "%d", settings.maxconns);
     APPEND_STAT("tcpport", "%d", settings.port);
     APPEND_STAT("udpport", "%d", settings.udpport);
@@ -2774,21 +2821,21 @@ static void process_stats_conns(ADD_STAT add_stats, void *c) {
 
     assert(add_stats);
 
-    for (i = 0; i < max_fds; i++) {
-        if (conns[i]) {
+    for (i = 0; i < freetotal; i++) {
+        if (freeconns[i]) {
             /* This is safe to do unlocked because conns are never freed; the
              * worst that'll happen will be a minor inconsistency in the
              * output -- not worth the complexity of the locking that'd be
              * required to prevent it.
              */
-            if (conns[i]->state != conn_closed) {
-                conn_to_str(conns[i], conn_name);
+            if (freeconns[i]->state != conn_closed) {
+                conn_to_str(freeconns[i], conn_name);
 
                 APPEND_NUM_STAT(i, "addr", "%s", conn_name);
                 APPEND_NUM_STAT(i, "state", "%s",
-                        state_text(conns[i]->state));
+                        state_text(freeconns[i]->state));
                 APPEND_NUM_STAT(i, "secs_since_last_cmd", "%d",
-                        current_time - conns[i]->last_cmd_time);
+                        current_time - freeconns[i]->last_cmd_time);
             }
         }
     }
@@ -2956,8 +3003,8 @@ static inline void process_get_command(conn *c, token_t *tokens, size_t ntokens,
                       return;
                   }
                   *(c->suffixlist + i) = suffix;
-                  int suffix_len = snprintf(suffix, SUFFIX_SIZE,
-                                            " %llu\r\n",
+                  int suffix_len = sprintf(suffix,
+                                            " %" PRIu64 "\r\n",
                                             (unsigned long long)ITEM_get_cas(it));
                   if (add_iov(c, "VALUE ", 6) != 0 ||
                       add_iov(c, ITEM_key(it), it->nkey) != 0 ||
@@ -3290,7 +3337,7 @@ enum delta_result_type do_add_delta(conn *c, const char *key, const size_t nkey,
     }
     pthread_mutex_unlock(&c->thread->stats.mutex);
 
-    snprintf(buf, INCR_MAX_STORAGE_LEN, "%llu", (unsigned long long)value);
+    snprintf(buf, INCR_MAX_STORAGE_LEN, "%" PRIu64, (unsigned long long)value);
     res = strlen(buf);
     /* refcount == 2 means we are the only ones holding the item, and it is
      * linked. We hold the item's lock in this function, so refcount cannot
@@ -3548,7 +3595,9 @@ static void process_command(conn *c, char *command) {
 
         if (settings.shutdown_command) {
             conn_set_state(c, conn_closing);
+#ifndef __WIN32__
             raise(SIGINT);
+#endif
         } else {
             out_string(c, "ERROR: shutdown not enabled");
         }
@@ -4083,7 +4132,7 @@ static void drive_machine(conn *c) {
                 break;
             }
             if (!use_accept4) {
-                if (fcntl(sfd, F_SETFL, fcntl(sfd, F_GETFL) | O_NONBLOCK) < 0) {
+                if (fcntl(sfd, F_SETFL, fcntl(sfd, F_GETFL, 0) | O_NONBLOCK) < 0) {
                     perror("setting O_NONBLOCK");
                     close(sfd);
                     break;
@@ -4417,7 +4466,7 @@ static void maximize_sndbuf(const int sfd) {
     int old_size;
 
     /* Start with the default size. */
-    if (getsockopt(sfd, SOL_SOCKET, SO_SNDBUF, &old_size, &intsize) != 0) {
+    if (getsockopt(sfd, SOL_SOCKET, SO_SNDBUF, (void *)&old_size, &intsize) != 0) {
         if (settings.verbose > 0)
             perror("getsockopt(SO_SNDBUF)");
         return;
@@ -4450,10 +4499,7 @@ static void maximize_sndbuf(const int sfd) {
  *        when they are successfully added to the list of ports we
  *        listen on.
  */
-static int server_socket(const char *interface,
-                         int port,
-                         enum network_transport transport,
-                         FILE *portnumber_file) {
+static int server_socket(const char *sInterface, int port, enum network_transport transport, FILE *portnumber_file) {
     int sfd;
     struct linger ling = {0, 0};
     struct addrinfo *ai;
@@ -4471,7 +4517,7 @@ static int server_socket(const char *interface,
         port = 0;
     }
     snprintf(port_buf, sizeof(port_buf), "%d", port);
-    error= getaddrinfo(interface, port_buf, &hints, &ai);
+    error= getaddrinfo(sInterface, port_buf, &hints, &ai);
     if (error != 0) {
         if (error != EAI_SYSTEM)
           fprintf(stderr, "getaddrinfo(): %s\n", gai_strerror(error));
@@ -4602,9 +4648,9 @@ static int server_sockets(int port, enum network_transport transport,
         return server_socket(settings.inter, port, transport, portnumber_file);
     } else {
         // tokenize them and bind to each one of them..
-        char *b;
         int ret = 0;
         char *list = strdup(settings.inter);
+        char *b = NULL;
 
         if (list == NULL) {
             fprintf(stderr, "Failed to allocate memory for parsing server interface string\n");
@@ -4950,17 +4996,17 @@ static void save_pid(const char *pid_file) {
     snprintf(tmp_pid_file, sizeof(tmp_pid_file), "%s.tmp", pid_file);
 
     if ((fp = fopen(tmp_pid_file, "w")) == NULL) {
-        vperror("Could not open the pid file %s for writing", tmp_pid_file);
+        fprintf(stderr, "Could not open the pid file %s for writing", tmp_pid_file);
         return;
     }
 
     fprintf(fp,"%ld\n", (long)getpid());
     if (fclose(fp) == -1) {
-        vperror("Could not close the pid file %s", tmp_pid_file);
+        fprintf(stderr, "Could not close the pid file %s", tmp_pid_file);
     }
 
     if (rename(tmp_pid_file, pid_file) != 0) {
-        vperror("Could not rename the pid file from %s to %s",
+        fprintf(stderr, "Could not rename the pid file from %s to %s",
                 tmp_pid_file, pid_file);
     }
 }
@@ -4970,10 +5016,25 @@ static void remove_pidfile(const char *pid_file) {
       return;
 
   if (unlink(pid_file) != 0) {
-      vperror("Could not remove the pid file %s", pid_file);
+      fprintf(stderr, "Could not remove the pid file %s", pid_file);
   }
 
 }
+
+void run_server()
+{
+    /* enter the loop */
+    //event_loop(0);
+    event_base_loop(main_base, 0);
+}
+
+void stop_server()
+{
+    /* exit the loop */
+    event_loopexit(NULL);
+}
+
+#ifndef __WIN32__
 
 static void sig_handler(const int sig) {
     printf("Signal handled: %s.\n", strsignal(sig));
@@ -4990,6 +5051,8 @@ static int sigignore(int sig) {
     return 0;
 }
 #endif
+
+#endif /* !__WIN32__ */
 
 
 /*
@@ -5062,10 +5125,13 @@ int main (int argc, char **argv) {
     bool lock_memory = false;
     bool do_daemonize = false;
     bool preallocate = false;
+    int daemonize_code = 0;
     int maxcore = 0;
     char *username = NULL;
     char *pid_file = NULL;
+#ifndef __WIN32__
     struct passwd *pw;
+#endif
     struct rlimit rlim;
     char *buf;
     char unit = '\0';
@@ -5117,25 +5183,23 @@ int main (int argc, char **argv) {
         [NOEXP_NOEVICT] = "expirezero_does_not_evict",
         NULL
     };
-
     if (!sanitycheck()) {
         return EX_OSERR;
     }
 
+#ifndef __WIN32__
+
     /* handle SIGINT and SIGTERM */
     signal(SIGINT, sig_handler);
     signal(SIGTERM, sig_handler);
-
+#endif
     /* init settings */
     settings_init();
-
     /* Run regardless of initializing it later */
     init_lru_crawler();
     init_lru_maintainer();
-
     /* set stderr non-buffering (for running under, say, daemontools) */
     setbuf(stderr, NULL);
-
     /* process arguments */
     while (-1 != (c = getopt(argc, argv,
           "a:"  /* access mask for unix socket */
@@ -5150,6 +5214,7 @@ int main (int argc, char **argv) {
           "hiV" /* help, licence info, version */
           "r"   /* maximize core file limit */
           "v"   /* verbose */
+          "d:"   /* daemon mode */
           "d"   /* daemon mode */
           "l:"  /* interface to listen on */
           "u:"  /* user identity to run as */
@@ -5231,6 +5296,16 @@ int main (int argc, char **argv) {
             break;
         case 'd':
             do_daemonize = true;
+            #ifdef __WIN32__
+			if(!optarg || !strcmpi(optarg, "runservice")) daemonize_code = 1;
+			else if(!strcmpi(optarg, "start")) daemonize_code = 2;
+			else if(!strcmpi(optarg, "restart")) daemonize_code = 3;
+			else if(!strcmpi(optarg, "stop")) daemonize_code = 4;
+			else if(!strcmpi(optarg, "shutdown")) daemonize_code = 5;
+			else if(!strcmpi(optarg, "install")) daemonize_code = 6;
+			else if(!strcmpi(optarg, "uninstall")) daemonize_code = 7;
+			else fprintf(stderr, "Illegal argument: \"%s\"\n", optarg);
+			#endif /* WIN32 */
             break;
         case 'r':
             maxcore = 1;
@@ -5560,7 +5635,7 @@ int main (int argc, char **argv) {
             exit(EX_OSERR);
         }
     }
-
+#ifndef __WIN32__#ifndef __WIN32__
     /* lose root privileges if we have them */
     if (getuid() == 0 || geteuid() == 0) {
         if (username == 0 || *username == '\0') {
@@ -5576,12 +5651,12 @@ int main (int argc, char **argv) {
             exit(EX_OSERR);
         }
     }
-
+#endif
     /* Initialize Sasl if -S was specified */
     if (settings.sasl) {
         init_sasl();
     }
-
+#ifndef __WIN32__
     /* daemonize if requested */
     /* if we want to ensure our ability to dump core, don't chdir to / */
     if (do_daemonize) {
@@ -5593,7 +5668,7 @@ int main (int argc, char **argv) {
             exit(EXIT_FAILURE);
         }
     }
-
+#endif
     /* lock paged memory if needed */
     if (lock_memory) {
 #ifdef HAVE_MLOCKALL
@@ -5606,6 +5681,41 @@ int main (int argc, char **argv) {
         fprintf(stderr, "warning: -k invalid, mlockall() not supported on this platform.  proceeding without.\n");
 #endif
     }
+#ifdef __WIN32__
+	switch(daemonize_code) {
+	        case 2:
+	            if(!ServiceStart()) {
+	                fprintf(stderr, "failed to start service\n");
+	                return 1;
+	            }
+	            exit(0);
+	        case 3:
+	            if(!ServiceRestart()) {
+	                fprintf(stderr, "failed to restart service\n");
+	                return 1;
+	            }
+	            exit(0);
+	        case 4:
+	        case 5:
+	            if(!ServiceStop()) {
+	                fprintf(stderr, "failed to stop service\n");
+	                return 1;
+	            }
+	            exit(0);
+	        case 6:
+	            if(!ServiceInstall()) {
+	                fprintf(stderr, "failed to install service or service already installed\n");
+	                return 1;
+	            }
+	            exit(0);
+	        case 7:
+	            if(!ServiceUninstall()) {
+	                fprintf(stderr, "failed to uninstall service or service not installed\n");
+	                return 1;
+	            }
+	            exit(0);
+    }
+#endif
 
     /* initialize main thread libevent instance */
     main_base = event_init();
@@ -5615,7 +5725,7 @@ int main (int argc, char **argv) {
     assoc_init(settings.hashpower_init);
     conn_init();
     slabs_init(settings.maxbytes, settings.factor, preallocate);
-
+#ifndef __WIN32__
     /*
      * ignore SIGPIPE signals; we can use errno == EPIPE if we
      * need that information
@@ -5624,6 +5734,7 @@ int main (int argc, char **argv) {
         perror("failed to ignore SIGPIPE; sigaction");
         exit(EX_OSERR);
     }
+#endif
     /* start up worker threads if MT mode */
     memcached_thread_init(settings.num_threads, main_base);
 
@@ -5653,7 +5764,7 @@ int main (int argc, char **argv) {
     if (settings.socketpath != NULL) {
         errno = 0;
         if (server_socket_unix(settings.socketpath,settings.access)) {
-            vperror("failed to listen on UNIX socket: %s", settings.socketpath);
+            fprintf(stderr, "failed to listen on UNIX socket: %s", settings.socketpath);
             exit(EX_OSERR);
         }
     }
@@ -5676,10 +5787,14 @@ int main (int argc, char **argv) {
             }
         }
 
+#ifndef WIN32
         errno = 0;
+#else /* !WIN32 */
+    _set_errno(0);
+#endif /* WIN32 */
         if (settings.port && server_sockets(settings.port, tcp_transport,
                                            portnumber_file)) {
-            vperror("failed to listen on TCP port %d", settings.port);
+            fprintf(stderr, "failed to listen on TCP port %d", settings.port);
             exit(EX_OSERR);
         }
 
@@ -5691,10 +5806,14 @@ int main (int argc, char **argv) {
          */
 
         /* create the UDP listening socket and bind it */
+#ifndef WIN32
         errno = 0;
+#else /* !WIN32 */
+    _set_errno(0);
+#endif /* WIN32 */
         if (settings.udpport && server_sockets(settings.udpport, udp_transport,
                                               portnumber_file)) {
-            vperror("failed to listen on UDP port %d", settings.udpport);
+            fprintf(stderr, "failed to listen on UDP port %d", settings.udpport);
             exit(EX_OSERR);
         }
 
@@ -5716,15 +5835,23 @@ int main (int argc, char **argv) {
     if (pid_file != NULL) {
         save_pid(pid_file);
     }
-
+#ifndef __WIN32__
     /* Drop privileges no longer needed */
     drop_privileges();
-
+#endif
+#ifdef __WIN32__
+    if (do_daemonize) {
+    	ServiceSetFunc(run_server, NULL, NULL, stop_server);
+        ServiceRun();
+    } else {
+        event_base_loop(main_base, 0);
+    }
+#else
     /* enter the event loop */
     if (event_base_loop(main_base, 0) != 0) {
         retval = EXIT_FAILURE;
     }
-
+#endif /* WIN32 */
     stop_assoc_maintenance_thread();
 
     /* remove the PID file if we're a daemon */

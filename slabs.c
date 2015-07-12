@@ -8,18 +8,26 @@
  * memcached protocol.
  */
 #include "memcached.h"
+
+#ifndef __WIN32__
 #include <sys/stat.h>
 #include <sys/socket.h>
 #include <sys/signal.h>
 #include <sys/resource.h>
-#include <fcntl.h>
 #include <netinet/in.h>
+#else
+#include <inttypes.h>
+#endif
+
+#include <fcntl.h>
 #include <errno.h>
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
 #include <assert.h>
 #include <pthread.h>
+
+
 
 /* powers-of-N allocation structures */
 
@@ -302,7 +310,7 @@ bool get_stats(const char *stat_type, int nkey, ADD_STAT add_stats, void *c) {
         if (!stat_type) {
             /* prepare general statistics for the engine */
             STATS_LOCK();
-            APPEND_STAT("bytes", "%llu", (unsigned long long)stats.curr_bytes);
+            APPEND_STAT("bytes", "%" PRIu64, (unsigned long long)stats.curr_bytes);
             APPEND_STAT("curr_items", "%u", stats.curr_items);
             APPEND_STAT("total_items", "%u", stats.total_items);
             STATS_UNLOCK();
@@ -351,23 +359,23 @@ static void do_slabs_stats(ADD_STAT add_stats, void *c) {
             APPEND_NUM_STAT(i, "free_chunks", "%u", p->sl_curr);
             /* Stat is dead, but displaying zero instead of removing it. */
             APPEND_NUM_STAT(i, "free_chunks_end", "%u", 0);
-            APPEND_NUM_STAT(i, "mem_requested", "%llu",
+            APPEND_NUM_STAT(i, "mem_requested", "%" PRIu64,
                             (unsigned long long)p->requested);
-            APPEND_NUM_STAT(i, "get_hits", "%llu",
+            APPEND_NUM_STAT(i, "get_hits", "%" PRIu64,
                     (unsigned long long)thread_stats.slab_stats[i].get_hits);
-            APPEND_NUM_STAT(i, "cmd_set", "%llu",
+            APPEND_NUM_STAT(i, "cmd_set", "%" PRIu64,
                     (unsigned long long)thread_stats.slab_stats[i].set_cmds);
-            APPEND_NUM_STAT(i, "delete_hits", "%llu",
+            APPEND_NUM_STAT(i, "delete_hits", "%" PRIu64,
                     (unsigned long long)thread_stats.slab_stats[i].delete_hits);
-            APPEND_NUM_STAT(i, "incr_hits", "%llu",
+            APPEND_NUM_STAT(i, "incr_hits", "%" PRIu64,
                     (unsigned long long)thread_stats.slab_stats[i].incr_hits);
-            APPEND_NUM_STAT(i, "decr_hits", "%llu",
+            APPEND_NUM_STAT(i, "decr_hits", "%" PRIu64,
                     (unsigned long long)thread_stats.slab_stats[i].decr_hits);
-            APPEND_NUM_STAT(i, "cas_hits", "%llu",
+            APPEND_NUM_STAT(i, "cas_hits", "%" PRIu64,
                     (unsigned long long)thread_stats.slab_stats[i].cas_hits);
-            APPEND_NUM_STAT(i, "cas_badval", "%llu",
+            APPEND_NUM_STAT(i, "cas_badval", "%" PRIu64,
                     (unsigned long long)thread_stats.slab_stats[i].cas_badval);
-            APPEND_NUM_STAT(i, "touch_hits", "%llu",
+            APPEND_NUM_STAT(i, "touch_hits", "%" PRIu64,
                     (unsigned long long)thread_stats.slab_stats[i].touch_hits);
             total++;
         }
@@ -376,7 +384,7 @@ static void do_slabs_stats(ADD_STAT add_stats, void *c) {
     /* add overall slab stats and append terminator */
 
     APPEND_STAT("active_slabs", "%d", total);
-    APPEND_STAT("total_malloced", "%llu", (unsigned long long)mem_malloced);
+    APPEND_STAT("total_malloced", "%" PRIu64, (unsigned long long)mem_malloced);
     add_stats(NULL, 0, NULL, 0, c);
 }
 

@@ -469,7 +469,12 @@ void dispatch_conn_new(int sfd, enum conn_states init_state, int event_flags,
  * Returns true if this is the thread that listens for new TCP connections.
  */
 int is_listen_thread() {
+#ifndef __WIN32__
     return pthread_self() == dispatcher_thread.thread_id;
+#else
+    pthread_t tid = pthread_self();
+    return(tid.p == dispatcher_thread.thread_id.p && tid.x == dispatcher_thread.thread_id.x);
+#endif
 }
 
 /********************************* ITEM ACCESS *******************************/
@@ -725,6 +730,16 @@ void memcached_thread_init(int nthreads, struct event_base *main_base) {
     int         i;
     int         power;
 
+#ifdef __WIN32__
+    struct sockaddr_in serv_addr;
+    int sockfd;
+
+    if ((sockfd = createLocalListSock(&serv_addr)) < 0)
+        exit(1);
+
+    pthread_win32_process_attach_np();
+#endif
+
     for (i = 0; i < POWER_LARGEST; i++) {
         pthread_mutex_init(&lru_locks[i], NULL);
     }
@@ -778,7 +793,11 @@ void memcached_thread_init(int nthreads, struct event_base *main_base) {
 
     for (i = 0; i < nthreads; i++) {
         int fds[2];
+#ifndef __WIN32__
         if (pipe(fds)) {
+#else
+        if (createLocalSocketPair(sockfd,fds,&serv_addr) == -1) {
+#endif
             perror("Can't create notify pipe");
             exit(1);
         }
@@ -787,6 +806,8 @@ void memcached_thread_init(int nthreads, struct event_base *main_base) {
         threads[i].notify_send_fd = fds[1];
 
         setup_thread(&threads[i]);
+        if (i == (nthreads - 1))
+            shutdown(sockfd, 2);
         /* Reserve three fds for the libevent base, and two for the pipe */
         stats.reserved_fds += 5;
     }

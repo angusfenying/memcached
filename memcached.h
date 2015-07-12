@@ -9,14 +9,21 @@
 #include "config.h"
 #endif
 
+#include <event.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <pthread.h>
+
+#ifndef __WIN32__
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <netinet/in.h>
-#include <event.h>
 #include <netdb.h>
-#include <pthread.h>
-#include <unistd.h>
+#else
+#include "win32.h"
+#include "sysexits.h"
+#endif
 
 #include "protocol_binary.h"
 #include "cache.h"
@@ -129,6 +136,12 @@
 /** Common APPEND_NUM_FMT_STAT format. */
 #define APPEND_NUM_STAT(num, name, fmt, val) \
     APPEND_NUM_FMT_STAT("%d:%s", num, name, fmt, val)
+
+#ifdef __GNUC__
+#define GNUC_FORMAT_PRINTF(x,y) __attribute__((format(printf, x, y)))
+#else
+#define GNUC_FORMAT_PRINTF(x,y)
+#endif
 
 /**
  * Callback for any function producing stats.
@@ -596,7 +609,7 @@ void slab_stats_aggregate(struct thread_stats *stats, struct slab_stats *out);
 
 /* Stat processing functions */
 void append_stat(const char *name, ADD_STAT add_stats, conn *c,
-                 const char *fmt, ...);
+                 const char *fmt, ...) GNUC_FORMAT_PRINTF(4, 5);
 
 enum store_item_type store_item(item *item, int comm, conn *c);
 
